@@ -154,7 +154,8 @@ def parse_crater_target_profile(data):
 
 def planetary_dtm_terrain_metrics(file_bytes, diameter_m, center_lon=67.1765,
                                   center_lat=1.3536, body="Moon",
-                                  source_name="Uploaded planetary DTM"):
+                                  source_name="Uploaded planetary DTM",
+                                  comparison_pixel_size_m=None):
     """Measure annular relief from a body-referenced DTM using the Earth footprint zones.
 
     Requires a projected or geographic raster CRS on the same planetary body. It
@@ -163,6 +164,8 @@ def planetary_dtm_terrain_metrics(file_bytes, diameter_m, center_lon=67.1765,
     from pyproj import CRS, Transformer
     from rasterio.io import MemoryFile
     from rasterio.windows import Window, from_bounds
+    from rasterio.warp import reproject, Resampling
+    from rasterio.transform import from_origin
 
     radii_m = {"Moon": 1_737_400.0, "Mars": 3_389_500.0}
     body_name = str(body).strip().title()
@@ -199,13 +202,31 @@ def planetary_dtm_terrain_metrics(file_bytes, diameter_m, center_lon=67.1765,
             if window.width < 1 or window.height < 1:
                 raise ValueError("Planetary DTM does not cover the target footprint")
             values = ds.read(1, window=window, masked=True).astype("float64")
-            rows, cols = np.indices(values.shape, dtype="float64")
-            transform = ds.window_transform(window)
-            xs = transform.c + (cols + 0.5) * transform.a + (rows + 0.5) * transform.b
-            ys = transform.f + (cols + 0.5) * transform.d + (rows + 0.5) * transform.e
-            local_x, local_y = source_to_local.transform(xs, ys)
-            distance = np.hypot(local_x, local_y)
-            valid = ~np.ma.getmaskarray(values) & np.isfinite(np.asarray(values))
+            # Estimate native local spacing at the crater center, then compare on
+            # no finer than the coarsest selected Earth DEM. Average resampling
+            # prevents the 3 m lunar DTM from dominating a ~30 m Earth DEM.
+            src_transform = ds.window_transform(window)
+            sx, sy = source_to_local.transform(
+                [src_transform.c, src_transform.c + src_transform.a,
+                 src_transform.c + src_transform.b],
+                [src_transform.f, src_transform.f + src_transform.d,
+                 src_transform.f + src_transform.e])
+            native_spacing = max(math.hypot(sx[1] - sx[0], sy[1] - sy[0]),
+                                 math.hypot(sx[2] - sx[0], sy[2] - sy[0]), 1e-6)
+            analysis_spacing = max(native_spacing, float(comparison_pixel_size_m or native_spacing))
+            cells = max(3, int(math.ceil(float(diameter_m) / analysis_spacing)))
+            extent = cells * analysis_spacing / 2
+            dst_transform = from_origin(-extent, extent, analysis_spacing, analysis_spacing)
+            dst = np.full((cells, cells), np.nan, dtype="float64")
+            src_array = np.asarray(values.filled(np.nan), dtype="float64")
+            reproject(src_array, dst, src_transform=src_transform, src_crs=ds.crs,
+                      src_nodata=np.nan, dst_transform=dst_transform, dst_crs=local,
+                      dst_nodata=np.nan, resampling=Resampling.average)
+            rows, cols = np.indices(dst.shape, dtype="float64")
+            xs = dst_transform.c + (cols + 0.5) * dst_transform.a
+            ys = dst_transform.f + (rows + 0.5) * dst_transform.e
+            distance = np.hypot(xs, ys)
+            valid = np.isfinite(dst)
             footprint = distance <= r
             center = distance <= r * 0.25
             annulus = (distance >= r * 0.75) & footprint
@@ -213,18 +234,11 @@ def planetary_dtm_terrain_metrics(file_bytes, diameter_m, center_lon=67.1765,
             footprint_coverage = coverage(footprint)
             center_coverage = coverage(center)
             annulus_coverage = coverage(annulus)
-            arr = np.asarray(values.filled(np.nan), dtype="float64")
-            center_samples = arr[center & valid]
-            annulus_samples = arr[annulus & valid]
+            center_samples = dst[center & valid]
+            annulus_samples = dst[annulus & valid]
             if not center_samples.size or not annulus_samples.size:
                 raise ValueError("DTM has no valid elevations in the center or outer annulus")
-            col_resolution = (float(np.nanmedian(np.hypot(np.diff(local_x, axis=1),
-                                                           np.diff(local_y, axis=1))))
-                              if local_x.shape[1] > 1 else float(diameter_m))
-            row_resolution = (float(np.nanmedian(np.hypot(np.diff(local_x, axis=0),
-                                                           np.diff(local_y, axis=0))))
-                              if local_y.shape[0] > 1 else float(diameter_m))
-            pixel_count_across = float(diameter_m) / max(col_resolution, row_resolution, 1e-9)
+            pixel_count_across = float(diameter_m) / analysis_spacing
             relief = float(annulus_samples.mean() - center_samples.mean())
             return {
                 "body": body_name, "annular_relief_m": relief,
@@ -233,6 +247,8 @@ def planetary_dtm_terrain_metrics(file_bytes, diameter_m, center_lon=67.1765,
                 "center_coverage_fraction": center_coverage,
                 "outer_annulus_coverage_fraction": annulus_coverage,
                 "cells_across": pixel_count_across,
+                "native_pixel_size_m": native_spacing,
+                "analysis_pixel_size_m": analysis_spacing,
                 "source": ds.tags().get("PRODUCT_ID", source_name),
                 "crs": ds.crs.to_string(),
                 "eligible": (footprint_coverage >= 0.95 and center_coverage >= 0.90

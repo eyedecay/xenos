@@ -3,6 +3,41 @@ from __future__ import annotations
 import math
 import numpy as np
 
+
+def coarsest_dem_pixel_size_m(dem_paths=(), dem_payloads=()):
+    """Return the largest physical DEM pixel dimension across selected rasters.
+
+    This gives planetary reference measurements a conservative common spacing
+    for comparison with the coarsest selected Earth DEM. Geographic rasters use
+    a latitude-adjusted meters-per-degree approximation.
+    """
+    import rasterio
+    from rasterio.io import MemoryFile
+
+    resolutions = []
+
+    def add_dataset_resolution(dataset):
+        if dataset.crs is None:
+            raise ValueError(f"DEM has no CRS: {dataset.name}")
+        if dataset.crs.is_geographic:
+            latitude = (dataset.bounds.bottom + dataset.bounds.top) / 2
+            dx = math.hypot(dataset.transform.a, dataset.transform.d) * 111320 * math.cos(math.radians(latitude))
+            dy = math.hypot(dataset.transform.b, dataset.transform.e) * 111320
+        else:
+            factor = dataset.crs.axis_info[0].unit_conversion_factor
+            dx = math.hypot(dataset.transform.a, dataset.transform.d) * factor
+            dy = math.hypot(dataset.transform.b, dataset.transform.e) * factor
+        resolutions.append(max(dx, dy))
+
+    for path in dem_paths:
+        with rasterio.open(path) as dataset:
+            add_dataset_resolution(dataset)
+    for name, content in dem_payloads:
+        with MemoryFile(content, filename=name) as memory:
+            with memory.open() as dataset:
+                add_dataset_resolution(dataset)
+    return max(resolutions) if resolutions else None
+
 def riley_terrain_ruggedness(elevation, valid=None):
     """Compute Riley TRI: sum of absolute center-to-8-neighbor elevation differences."""
     elevation = np.asarray(elevation, dtype="float32")

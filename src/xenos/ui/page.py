@@ -15,6 +15,7 @@ import streamlit as st
 from src.xenos import (
     characterize_lroc_products, coverage_aware_psi, load_lunar_reference,
     lunar_dtm_profile, planetary_dtm_terrain_metrics, parse_crater_target_profile,
+    coarsest_dem_pixel_size_m,
     scan_candidates, scan_uploaded_region, scan_region_collection,
 )
 from src.xenos.sentinel import process_sentinel2_uploads, sentinel_candidate_metrics
@@ -30,6 +31,7 @@ from src.xenos.ui.validation import render_validation
 from src.xenos.ui.exports import render_exports
 from src.xenos.ui.briefing import render_candidate_briefing
 from src.xenos.regions import discover_region_profiles, discover_target_profiles
+from src.xenos.region_builder import build_copernicus_region_pack
 BASELINE, REFERENCE = load_lunar_reference()
 DEFAULT_MORPH = REFERENCE["morphology"]
 
@@ -62,6 +64,11 @@ def run_pipeline(diameter_m, target_ratio, region_label, region_name, dem_payloa
 
 
 def main():
+    if st.session_state.pop("_xenos_select_installed_once", False):
+        st.session_state["region_source_select"] = "Installed region catalog"
+    region_to_select = st.session_state.pop("_xenos_region_to_select", None)
+    if region_to_select:
+        st.session_state["installed_region_selection"] = [region_to_select]
     render_page_chrome(st)
     with st.sidebar:
         st.markdown('<div class="eyebrow">Mission parameters</div>', unsafe_allow_html=True)
@@ -115,18 +122,24 @@ def main():
             planetary_dtm_source = None
         st.markdown("---")
         st.markdown("**Earth search regions**")
-        region_source = st.selectbox("Region data", ["Installed region catalog", "Upload one region for this run"])
         available_regions = discover_region_profiles()
+        region_source = st.selectbox(
+            "Region data",
+            ["Installed region catalog", "Explore an area with Copernicus AWS", "Upload one region for this run"],
+            key="region_source_select",
+        )
         region_profiles = []
         dem_uploads = geology_upload = None
         custom_region_name = "Uploaded Earth region"
         custom_region_citation = ""
+        prepare_copernicus_region = False
         if region_source == "Installed region catalog":
             region_names = [profile["name"] for profile in available_regions]
             selected_region_names = st.multiselect(
                 "Search one or more installed regions", region_names,
                 default=region_names[:1],
                 help="Each region is analyzed against its own DEM and geology layer; results are merged with per-region representation.",
+                key="installed_region_selection",
             )
             region_profiles = [profile for profile in available_regions if profile["name"] in selected_region_names]
             region_choice = "Installed region catalog"
@@ -134,12 +147,29 @@ def main():
                 st.caption("Only Columbia River Basalts data are currently installed. Add cited region packs to data/earth/regions; see docs/region-packs/README.md.")
             elif not available_regions:
                 st.info("No complete local region packs found. Add a region pack or upload one for this run.")
-        else:
+        elif region_source == "Upload one region for this run":
             custom_region_name = st.text_input("Region name", value="Uploaded Earth region")
             custom_region_citation = st.text_input("DEM and geology source citation", placeholder="Dataset title, version, URL, license")
             dem_uploads = st.file_uploader("Upload georeferenced DEM GeoTIFF tiles", type=["tif", "tiff"], accept_multiple_files=True, key="region_dems")
             geology_upload = st.file_uploader("Upload GLiM-compatible geology polygons", type=["gpkg", "geojson"], key="region_geology", help="Vector layer must carry Litho and xx class-code fields.")
             region_choice = "Uploaded region"
+        else:
+            st.caption("Fetch up to four public Copernicus GLO-30 tiles for a small area. Xenos clips the global GLiM database already in this project. No AWS credentials are needed; an internet connection is required.")
+            with st.form("copernicus_area_form", clear_on_submit=False):
+                copernicus_region_name = st.text_input(
+                    "Region display name", value="Iceland volcanic field",
+                    help="This is only a label for the saved region. The coordinates below determine which Copernicus tiles and GLiM polygons are processed.",
+                )
+                west_col, south_col = st.columns(2)
+                with west_col:
+                    copernicus_west = st.number_input("West longitude", min_value=-180.0, max_value=179.99, value=-22.0, step=0.1, format="%.4f")
+                    copernicus_south = st.number_input("South latitude", min_value=-90.0, max_value=89.99, value=63.0, step=0.1, format="%.4f")
+                with south_col:
+                    copernicus_east = st.number_input("East longitude", min_value=-179.99, max_value=180.0, value=-21.0, step=0.1, format="%.4f")
+                    copernicus_north = st.number_input("North latitude", min_value=-89.99, max_value=90.0, value=64.0, step=0.1, format="%.4f")
+                prepare_copernicus_region = st.form_submit_button("Download DEM + prepare geology", width="stretch")
+            copernicus_bounds = (copernicus_west, copernicus_south, copernicus_east, copernicus_north)
+            region_choice = "Copernicus AWS region"
         st.markdown("**Candidate footprint**")
         if target_error:
             st.error(target_error)
@@ -149,6 +179,43 @@ def main():
             st.caption("Uses matching annular-relief metrics when a suitable planetary DTM is available; otherwise uses a clearly labeled unlike-measure proxy.")
             run_scan = st.form_submit_button("◉  Run regional analog scan", use_container_width=True)
         st.markdown('<p class="smallnote">Candidate windows are Earth analog candidates, not confirmed craters or landing-site safety assessments.</p>', unsafe_allow_html=True)
+
+    if prepare_copernicus_region:
+        try:
+            with st.status("Preparing the new Earth region…", expanded=True) as prep_status:
+                result = build_copernicus_region_pack(
+                    copernicus_region_name, copernicus_bounds,
+                    progress_callback=lambda message: prep_status.update(label=message, state="running", expanded=True),
+                )
+                prep_status.update(
+                    label=f"Region ready · {result['tiles_downloaded']} DEM tiles · {result['glim_features']:,} GLiM polygons",
+                    state="complete", expanded=False,
+                )
+            st.session_state["_xenos_select_installed_once"] = True
+            st.session_state["_xenos_region_to_select"] = result["name"]
+            st.session_state["_xenos_region_created"] = result
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not prepare the Copernicus region: {exc}")
+
+    created_region = st.session_state.pop("_xenos_region_created", None)
+    if created_region:
+        missing_note = (f" · unavailable DEM tiles: {', '.join(created_region['tiles_missing'])}"
+                        if created_region["tiles_missing"] else "")
+        st.success(f"Added {created_region['name']} to the local region catalog: {created_region['tiles_downloaded']} Copernicus DEM tile(s), {created_region['glim_features']:,} clipped GLiM polygons{missing_note}. Review the source limitations, then run the candidate scan.")
+
+    dem_payloads = [(file.name, file.getvalue()) for file in (dem_uploads or [])]
+    geology_payload = ((geology_upload.name, geology_upload.getvalue())
+                       if geology_upload is not None else ("", b""))
+    selected_dem_paths = [path for profile in region_profiles for path in profile["dem_paths"]]
+    try:
+        earth_comparison_resolution_m = coarsest_dem_pixel_size_m(
+            selected_dem_paths if region_source == "Installed region catalog" else (),
+            dem_payloads if region_source != "Installed region catalog" else (),
+        )
+    except Exception as exc:
+        earth_comparison_resolution_m = None
+        st.sidebar.warning(f"Could not determine Earth DEM resolution for target comparison: {exc}")
 
     # The planetary DTM only replaces the unlike-measure proxy when the same annular
     # geometry has adequate coverage and resolution on the planetary raster.
@@ -166,10 +233,11 @@ def main():
                 raise ValueError("Add latitude_deg and longitude_deg to the cited target profile before uploading its DTM")
             target_dtm_metrics = planetary_dtm_terrain_metrics(
                 dtm_bytes, diameter, target_lon, target_lat, active_target["body"],
-                source_name=planetary_dtm_source)
+                source_name=planetary_dtm_source,
+                comparison_pixel_size_m=earth_comparison_resolution_m)
             if target_dtm_metrics["eligible"]:
                 target_ratio = target_dtm_metrics["annular_relief_ratio"]
-                target_metric_name = "DTM-derived annular-relief ratio (same metric)"
+                target_metric_name = "resolution-matched DTM annular-relief ratio"
             else:
                 target_dtm_error = ("DTM coverage, relief sign, or resolution does not pass the reference gates; "
                                     "the scan uses the published depth/diameter proxy.")
@@ -196,15 +264,14 @@ def main():
     with c: metric(st, "Reference wall slope median", str(active_target.get('average_wall_slope_deg') if active_target.get('average_wall_slope_deg') is not None else 'n/a'), "°")
     with d: metric(st, "Reference imagery", "LROC NAC" if is_default_target else "Not bundled", "")
 
-    dem_payloads = [(file.name, file.getvalue()) for file in (dem_uploads or [])]
-    geology_payload = ((geology_upload.name, geology_upload.getvalue())
-                       if geology_upload is not None else ("", b""))
     region_specs = tuple(
         (p["id"], p["name"], tuple(str(path) for path in p["dem_paths"]),
          str(p["geology_path"]), p.get("citation", "Not supplied"))
         for p in region_profiles
     )
-    region_ready = bool(region_profiles) if region_source == "Installed region catalog" else bool(dem_payloads and geology_payload[1])
+    region_ready = (bool(region_profiles) if region_source == "Installed region catalog"
+                    else bool(dem_payloads and geology_payload[1])
+                    if region_source == "Upload one region for this run" else False)
     requested_scan_args = (diameter, target_ratio, region_choice,
                            tuple((profile_id, name, dem_paths, geology_path,
                                   tuple((Path(path).stat().st_size, Path(path).stat().st_mtime_ns) for path in dem_paths),

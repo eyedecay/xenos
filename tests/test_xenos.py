@@ -11,6 +11,7 @@ from xenos import (
     geology_relevance_score,
     lunar_dtm_profile,
     parse_crater_target_profile,
+    planetary_dtm_terrain_metrics,
     riley_terrain_ruggedness,
     scan_uploaded_region,
     slope_distribution,
@@ -52,6 +53,30 @@ class CircularTerrainTests(unittest.TestCase):
         self.assertEqual(annular_relief_proxy_score(0.19, 0.19), 100.0)
         self.assertEqual(annular_relief_proxy_score(0.38, 0.19), 0.0)
         self.assertEqual(annular_relief_proxy_score(-0.1, 0.19), 0.0)
+
+    def test_planetary_dtm_is_average_resampled_to_earth_spacing(self):
+        import rasterio
+        from rasterio.io import MemoryFile
+        from rasterio.transform import from_origin
+
+        n, resolution = 501, 3.0
+        yy, xx = np.mgrid[:n, :n]
+        radius = np.hypot((xx - n / 2) * resolution, (yy - n / 2) * resolution)
+        elevation = np.where(radius < 30, 0.0, 40.0).astype("float32")
+        lunar_crs = "+proj=aeqd +lat_0=1.3536 +lon_0=67.1765 +a=1737400 +b=1737400 +units=m +no_defs +type=crs"
+        with MemoryFile() as memory:
+            with memory.open(driver="GTiff", height=n, width=n, count=1,
+                             dtype="float32", crs=lunar_crs,
+                             transform=from_origin(-n * resolution / 2,
+                                                   n * resolution / 2,
+                                                   resolution, resolution)) as dataset:
+                dataset.write(elevation, 1)
+            measured = planetary_dtm_terrain_metrics(
+                memory.read(), 240, comparison_pixel_size_m=30)
+        self.assertAlmostEqual(measured["native_pixel_size_m"], 3.0, places=3)
+        self.assertAlmostEqual(measured["analysis_pixel_size_m"], 30.0, places=3)
+        self.assertAlmostEqual(measured["cells_across"], 8.0, places=3)
+        self.assertTrue(np.isfinite(measured["annular_relief_ratio"]))
 
 
 class GeologicalScoreTests(unittest.TestCase):
@@ -191,6 +216,64 @@ class DiscoveryFrameworkTests(unittest.TestCase):
         self.assertGreater(summary["tiles_read"], 0)
         self.assertTrue(candidates)
         self.assertIn("geology", candidates[0])
+
+
+class RegionBuilderTests(unittest.TestCase):
+    def test_copernicus_tile_names_and_small_bounds(self):
+        from src.xenos.region_builder import copernicus_tile_name, copernicus_tiles_for_bounds
+
+        self.assertEqual(copernicus_tile_name(45, -121),
+                         "Copernicus_DSM_COG_10_N45_00_W121_00_DEM")
+        self.assertEqual(copernicus_tile_name(-1, 0),
+                         "Copernicus_DSM_COG_10_S01_00_E000_00_DEM")
+        tiles = copernicus_tiles_for_bounds((-121, 45, -120, 46))
+        self.assertEqual(len(tiles), 1)
+        self.assertEqual(tiles[0], "Copernicus_DSM_COG_10_N45_00_W121_00_DEM")
+        self.assertEqual(len(copernicus_tiles_for_bounds((-121, 45, -119, 47))), 4)
+        self.assertEqual(len(copernicus_tiles_for_bounds((-121, 45, -118, 47))), 6)
+
+    def test_build_pack_clips_local_glim_and_preserves_source(self):
+        import geopandas as gpd
+        import rasterio
+        from rasterio.transform import from_origin
+        from shapely.geometry import box
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        from unittest.mock import patch
+        from src.xenos import region_builder
+
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "global.gpkg"
+            global_frame = gpd.GeoDataFrame(
+                {"Litho": ["vb____", "ss____"], "xx": ["vb", "ss"]},
+                geometry=[box(-2, -2, 2, 2), box(2, 2, 3, 3)], crs="EPSG:4326",
+            )
+            global_frame.to_file(source, layer="GLiM_export", driver="GPKG")
+
+            def mock_download(tile, destination):
+                destination = Path(destination)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with rasterio.open(destination, "w", driver="GTiff", height=4, width=4,
+                                   count=1, dtype="float32", crs="EPSG:4326",
+                                   transform=from_origin(-1, 1, 0.25, 0.25)) as ds:
+                    ds.write(np.ones((4, 4), dtype="float32"), 1)
+                return True
+
+            with patch.object(region_builder, "_download_tile", side_effect=mock_download):
+                result = region_builder.build_copernicus_region_pack(
+                    "Test Area", (-1, 0, 0, 1), output_root=root / "regions",
+                    glim_source=source,
+                )
+            clipped = gpd.read_file(result["path"] / "geology/glim_region.gpkg")
+            original = gpd.read_file(source, layer="GLiM_export")
+            manifest_exists = (result["path"] / "region.json").is_file()
+        self.assertEqual(result["tiles_downloaded"], 1)
+        self.assertEqual(result["glim_features"], 1)
+        self.assertEqual(len(clipped), 1)
+        self.assertEqual(set(clipped["xx"]), {"vb"})
+        self.assertEqual(len(original), 2)
+        self.assertTrue(manifest_exists)
 
 
 class PRDModuleTests(unittest.TestCase):

@@ -27,7 +27,9 @@ def render_reference_panel(st, left, is_default_target, REFERENCE, MORPH, LUNAR,
         if target_dtm_metrics:
             m = target_dtm_metrics
             st.metric("Planetary DTM annular relief", f"{m['annular_relief_m']:.2f} m" if m["eligible"] else "Not eligible")
-            st.caption(f"Same inner disk / outer annulus as the Earth DEM · ratio {m['annular_relief_ratio']:.4f} · footprint coverage {m['dem_coverage_fraction']:.1%} · resolution {m['cells_across']:.1f} cells across · {m['source']}.")
+            st.caption(f"Same inner disk / outer annulus as the Earth DEM · ratio {m['annular_relief_ratio']:.4f} · footprint coverage {m['dem_coverage_fraction']:.1%} · {m['cells_across']:.1f} cells across · {m['source']}.")
+            if m.get("analysis_pixel_size_m"):
+                st.caption(f"Planetary source spacing: {m['native_pixel_size_m']:.1f} m/px · measurement grid: {m['analysis_pixel_size_m']:.1f} m/px. When the selected Earth DEM is coarser, the planetary DTM is average-resampled to that spacing. This improves scale comparability but does not remove differences between sensors or terrain products.")
             st.caption(f"Terrain comparison uses {target_metric_name}.")
         elif is_default_target:
             st.info("No suitable planetary DTM supplied. Terrain ranking uses the published depth/diameter ratio as an unlike-measure screening proxy; it is not a crater-depth match.")

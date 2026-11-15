@@ -2,6 +2,7 @@
 from .analysis.terrain import (
     riley_terrain_ruggedness, slope_distribution, circular_zone_masks,
     circular_window_metrics, annular_relief_proxy_score, stratified_candidate_indices,
+    coarsest_dem_pixel_size_m,
 )
 from .analysis.geology import (
     GLIM_CLASS_LABELS, load_geology, geology_relevance_score,
