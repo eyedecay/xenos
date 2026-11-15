@@ -41,13 +41,39 @@ def discover_region_profiles():
                 "name": raw["name"], "dem_paths": dem_paths,
                 "geology_path": geology_path, "relevant_glim_codes": codes,
                 "citation": raw.get("citation", "Not supplied"),
+                "area_bounds": raw.get("bounds_wgs84"),
+                "copernicus_tiles": raw.get("copernicus_tiles"),
+                "place_lookup": raw.get("place_lookup"),
             })
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             continue
-    # Keep the local bundled region first and prevent ambiguous duplicate names.
+    # Don't let differently named copies of the same Copernicus area over-represent
+    # one geographic source in a multi-region scan.
     unique = {}
     for profile in profiles:
-        unique[profile["name"]] = profile
+        bounds = profile.get("area_bounds")
+        tiles = profile.get("copernicus_tiles")
+        identity = (("copernicus", tuple(bounds), tuple(tiles))
+                    if bounds and tiles else ("name", profile["name"]))
+        current = unique.get(identity)
+        if current is None:
+            profile["duplicate_aliases"] = []
+            unique[identity] = profile
+            continue
+        aliases = current.setdefault("duplicate_aliases", [])
+        aliases.extend([current["name"], profile["name"],
+                        *profile.get("duplicate_aliases", [])])
+        # A geocoder-backed label is stronger provenance; otherwise retain the
+        # most informative human label without deleting the source packs.
+        current_priority = (bool(current.get("place_lookup")), len(current["name"]))
+        profile_priority = (bool(profile.get("place_lookup")), len(profile["name"]))
+        if profile_priority > current_priority:
+            profile["duplicate_aliases"] = aliases
+            unique[identity] = profile
+    for profile in unique.values():
+        profile["duplicate_aliases"] = sorted(
+            set(profile.get("duplicate_aliases", [])) - {profile["name"]}
+        )
     return list(unique.values())
 
 

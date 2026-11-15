@@ -31,7 +31,10 @@ from src.xenos.ui.validation import render_validation
 from src.xenos.ui.exports import render_exports
 from src.xenos.ui.briefing import render_candidate_briefing
 from src.xenos.regions import discover_region_profiles, discover_target_profiles
-from src.xenos.region_builder import build_copernicus_region_pack
+from src.xenos.region_builder import (
+    build_copernicus_region_pack, copernicus_tiles_for_bounds,
+)
+from src.xenos.place_search import search_named_places, square_bounds_around_place
 BASELINE, REFERENCE = load_lunar_reference()
 DEFAULT_MORPH = REFERENCE["morphology"]
 
@@ -40,6 +43,12 @@ DEFAULT_MORPH = REFERENCE["morphology"]
 def cached_lroc_products():
     """Read the large LROC EDR images once, then reuse their summary on reruns."""
     return characterize_lroc_products()
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def cached_place_search(query):
+    """Cache committed Photon searches so repeated queries do not hit the service."""
+    return search_named_places(query)
 
 
 @st.cache_data(show_spinner=False)
@@ -142,6 +151,11 @@ def main():
                 key="installed_region_selection",
             )
             region_profiles = [profile for profile in available_regions if profile["name"] in selected_region_names]
+            duplicate_names = sorted({alias for profile in region_profiles
+                                       for alias in profile.get("duplicate_aliases", [])})
+            if duplicate_names:
+                st.info("Some saved entries share the same Copernicus area and are counted once: "
+                        + ", ".join(duplicate_names))
             region_choice = "Installed region catalog"
             if len(available_regions) == 1:
                 st.caption("Only Columbia River Basalts data are currently installed. Add cited region packs to data/earth/regions; see docs/region-packs/README.md.")
@@ -154,21 +168,75 @@ def main():
             geology_upload = st.file_uploader("Upload GLiM-compatible geology polygons", type=["gpkg", "geojson"], key="region_geology", help="Vector layer must carry Litho and xx class-code fields.")
             region_choice = "Uploaded region"
         else:
-            st.caption("Fetch up to four public Copernicus GLO-30 tiles for a small area. Xenos clips the global GLiM database already in this project. No AWS credentials are needed; an internet connection is required.")
-            with st.form("copernicus_area_form", clear_on_submit=False):
-                copernicus_region_name = st.text_input(
-                    "Region display name", value="Iceland volcanic field",
-                    help="This is only a label for the saved region. The coordinates below determine which Copernicus tiles and GLiM polygons are processed.",
+            st.caption("Search place names, select a match, and Xenos will center a bounded search area there. Place names come from Photon using OpenStreetMap data; Copernicus itself provides tile IDs, not named places.")
+            with st.form("place_lookup_form", clear_on_submit=False):
+                place_query = st.text_input(
+                    "Search for a place", placeholder="Atacama Desert, Haughton Crater, Iceland…",
+                    help="Submit a place name to see matching locations. Your query is sent to Photon/Komoot and cached for one day.",
                 )
-                west_col, south_col = st.columns(2)
-                with west_col:
-                    copernicus_west = st.number_input("West longitude", min_value=-180.0, max_value=179.99, value=-22.0, step=0.1, format="%.4f")
-                    copernicus_south = st.number_input("South latitude", min_value=-90.0, max_value=89.99, value=63.0, step=0.1, format="%.4f")
-                with south_col:
-                    copernicus_east = st.number_input("East longitude", min_value=-179.99, max_value=180.0, value=-21.0, step=0.1, format="%.4f")
-                    copernicus_north = st.number_input("North latitude", min_value=-89.99, max_value=90.0, value=64.0, step=0.1, format="%.4f")
-                prepare_copernicus_region = st.form_submit_button("Download DEM + prepare geology", width="stretch")
-            copernicus_bounds = (copernicus_west, copernicus_south, copernicus_east, copernicus_north)
+                search_places = st.form_submit_button("Find matching places", width="stretch")
+            if search_places:
+                try:
+                    found_places = cached_place_search(place_query)
+                    st.session_state["xenos_place_search_results"] = found_places
+                    st.session_state["xenos_place_search_query"] = place_query
+                    st.session_state.pop("xenos_place_search_error", None)
+                except Exception as exc:
+                    st.session_state["xenos_place_search_results"] = []
+                    st.session_state["xenos_place_search_error"] = str(exc)
+            if st.session_state.get("xenos_place_search_error"):
+                st.warning(f"Place search failed: {st.session_state['xenos_place_search_error']}")
+            place_results = st.session_state.get("xenos_place_search_results", [])
+            if place_results:
+                place_options = {item["id"]: item for item in place_results}
+                result_set_key = hashlib.sha1("|".join(place_options).encode()).hexdigest()[:10]
+                selected_place_id = st.selectbox(
+                    "Matching places", list(place_options),
+                    format_func=lambda key: place_options[key]["label"],
+                    key=f"xenos_place_match_{result_set_key}",
+                )
+                selected_place = place_options[selected_place_id]
+                area_width_km = st.selectbox(
+                    "Search area width around this place", [25, 50, 100], index=1,
+                    format_func=lambda value: f"{value} km × {value} km",
+                    key=f"xenos_area_width_{selected_place_id}",
+                    help="This is a square centered on the selected place, not the full boundary of the named feature.",
+                )
+                copernicus_bounds = square_bounds_around_place(
+                    selected_place["longitude"], selected_place["latitude"], area_width_km)
+                copernicus_region_name = st.text_input(
+                    "Region display name", value=selected_place["name"],
+                    key=f"xenos_region_label_{selected_place_id}",
+                    help="This label does not change the searched data.",
+                )
+                selected_tiles = copernicus_tiles_for_bounds(copernicus_bounds)
+                st.caption(
+                    f"Center: {selected_place['latitude']:.4f}, {selected_place['longitude']:.4f} · "
+                    f"area bounds: W {copernicus_bounds[0]:.4f}, S {copernicus_bounds[1]:.4f}, "
+                    f"E {copernicus_bounds[2]:.4f}, N {copernicus_bounds[3]:.4f} · "
+                    f"Copernicus tiles: {len(selected_tiles)}"
+                )
+                st.caption("Place search: Photon by Komoot · © OpenStreetMap contributors. Place queries are sent to the geocoding service when you press Find matching places.")
+                if len(selected_tiles) > 4:
+                    st.warning(f"This area intersects {len(selected_tiles)} Copernicus tiles. Choose a smaller search width (maximum four tiles).")
+                with st.form("copernicus_prepare_form", clear_on_submit=False):
+                    prepare_copernicus_region = st.form_submit_button(
+                        "Download DEM + prepare geology", width="stretch",
+                        disabled=len(selected_tiles) > 4,
+                    )
+                place_result_metadata = {
+                    "provider": "Photon/Komoot with OpenStreetMap data",
+                    "display_name": selected_place["label"],
+                    "latitude": selected_place["latitude"],
+                    "longitude": selected_place["longitude"],
+                    "osm_type": selected_place["osm_type"],
+                    "osm_id": selected_place["osm_id"],
+                }
+            else:
+                copernicus_region_name = ""
+                copernicus_bounds = None
+                place_result_metadata = None
+                st.info("Search for a place to choose an area. You no longer need to enter longitude and latitude manually.")
             region_choice = "Copernicus AWS region"
         st.markdown("**Candidate footprint**")
         if target_error:
@@ -186,6 +254,7 @@ def main():
                 result = build_copernicus_region_pack(
                     copernicus_region_name, copernicus_bounds,
                     progress_callback=lambda message: prep_status.update(label=message, state="running", expanded=True),
+                    place_result=place_result_metadata,
                 )
                 prep_status.update(
                     label=f"Region ready · {result['tiles_downloaded']} DEM tiles · {result['glim_features']:,} GLiM polygons",
@@ -202,7 +271,8 @@ def main():
     if created_region:
         missing_note = (f" · unavailable DEM tiles: {', '.join(created_region['tiles_missing'])}"
                         if created_region["tiles_missing"] else "")
-        st.success(f"Added {created_region['name']} to the local region catalog: {created_region['tiles_downloaded']} Copernicus DEM tile(s), {created_region['glim_features']:,} clipped GLiM polygons{missing_note}. Review the source limitations, then run the candidate scan.")
+        action = "Reusing the existing" if created_region.get("reused") else "Added"
+        st.success(f"{action} {created_region['name']} region: {created_region['tiles_downloaded']} Copernicus DEM tile(s), {created_region['glim_features']:,} clipped GLiM polygons{missing_note}. Review the source limitations, then run the candidate scan.")
 
     dem_payloads = [(file.name, file.getvalue()) for file in (dem_uploads or [])]
     geology_payload = ((geology_upload.name, geology_upload.getvalue())

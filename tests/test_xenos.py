@@ -262,18 +262,76 @@ class RegionBuilderTests(unittest.TestCase):
 
             with patch.object(region_builder, "_download_tile", side_effect=mock_download):
                 result = region_builder.build_copernicus_region_pack(
-                    "Test Area", (-1, 0, 0, 1), output_root=root / "regions",
+                    "Test Area", (-0.75, 0.25, -0.25, 0.75), output_root=root / "regions",
                     glim_source=source,
                 )
             clipped = gpd.read_file(result["path"] / "geology/glim_region.gpkg")
             original = gpd.read_file(source, layer="GLiM_export")
             manifest_exists = (result["path"] / "region.json").is_file()
+            with rasterio.open(next((result["path"] / "dem").glob("*.tif"))) as analysis_dem:
+                analysis_bounds = analysis_dem.bounds
+                analysis_shape = analysis_dem.shape
+            with rasterio.open(next((result["path"] / "source_dem").glob("*.tif"))) as raw_dem:
+                source_shape = raw_dem.shape
         self.assertEqual(result["tiles_downloaded"], 1)
         self.assertEqual(result["glim_features"], 1)
         self.assertEqual(len(clipped), 1)
         self.assertEqual(set(clipped["xx"]), {"vb"})
         self.assertEqual(len(original), 2)
         self.assertTrue(manifest_exists)
+        self.assertEqual(analysis_shape, (2, 2))
+        self.assertGreater(source_shape[0], analysis_shape[0])
+        self.assertGreater(source_shape[1], analysis_shape[1])
+        self.assertAlmostEqual(analysis_bounds.left, -0.75)
+        self.assertAlmostEqual(analysis_bounds.right, -0.25)
+
+    def test_place_search_results_and_automatic_square_bounds(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        from src.xenos.place_search import search_named_places, square_bounds_around_place
+
+        payload = {"features": [{
+            "geometry": {"coordinates": [-21.5, 63.5]},
+            "properties": {"name": "Iceland", "country": "Iceland", "osm_type": "R", "osm_id": 9},
+        }]}
+        response = SimpleNamespace(raise_for_status=lambda: None, json=lambda: payload)
+        with patch("requests.get", return_value=response) as get:
+            results = search_named_places("Iceland")
+        get.assert_called_once()
+        self.assertEqual(results[0]["label"], "Iceland")
+        bounds = square_bounds_around_place(-21.5, 63.5, 50)
+        self.assertAlmostEqual((bounds[0] + bounds[2]) / 2, -21.5)
+        self.assertAlmostEqual((bounds[1] + bounds[3]) / 2, 63.5)
+
+    def test_region_catalog_merges_same_area_aliases_for_scoring(self):
+        import json
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from unittest.mock import patch
+        from src.xenos import regions
+
+        bounds = [-22, 63, -21, 64]
+        tile = "Copernicus_DSM_COG_10_N63_00_W022_00_DEM"
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            for index, name in enumerate(("canada", "Iceland volcanic field", "p")):
+                pack = root / f"pack{index}"
+                (pack / "dem").mkdir(parents=True)
+                (pack / "geology").mkdir()
+                (pack / "dem" / f"{tile}.tif").write_bytes(b"same source tile")
+                (pack / "geology" / "glim.gpkg").write_bytes(b"same geology")
+                (pack / "region.json").write_text(json.dumps({
+                    "id": f"id{index}", "name": name, "dem_globs": ["dem/*.tif"],
+                    "geology_file": "geology/glim.gpkg", "bounds_wgs84": bounds,
+                    "copernicus_tiles": [tile], "relevant_glim_codes": [],
+                }))
+            with patch.object(regions, "REGION_PACKS_DIR", root), \
+                 patch.object(regions, "DEM_DIR", root / "no-columbia"), \
+                 patch.object(regions, "GEOLOGY", root / "no-columbia.gpkg"):
+                profiles = regions.discover_region_profiles()
+        self.assertEqual(len(profiles), 1)
+        self.assertEqual(profiles[0]["name"], "Iceland volcanic field")
+        self.assertEqual(set(profiles[0]["duplicate_aliases"]), {"canada", "p"})
 
 
 class PRDModuleTests(unittest.TestCase):
