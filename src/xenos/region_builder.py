@@ -211,8 +211,9 @@ def build_copernicus_region_pack(name, bounds, *, output_root=REGION_PACKS_DIR,
         geology_count = _clip_global_glim(
             bounds, stage / "geology" / "glim_region.gpkg", source_path=glim_source)
         citation = ("Copernicus DEM GLO-30 Public COG, accessed " + date.today().isoformat() +
-                    " (https://registry.opendata.aws/copernicus-dem/); " + GLIM_CITATION +
-                    "; place lookup via Photon/Komoot using OpenStreetMap data")
+                    " (https://registry.opendata.aws/copernicus-dem/); " + GLIM_CITATION)
+        if place_result:
+            citation += "; place lookup via Photon/Komoot using OpenStreetMap data"
         manifest = {
             "id": region_id, "name": name, "dem_globs": ["dem/*.tif"],
             "source_dem_globs": ["source_dem/*.tif"],

@@ -1,8 +1,7 @@
 """Render candidate panel UI feature."""
 
-def render_candidate_panel(st, right, go, np, math, filtered_candidates, candidates, format_coordinates, process_sentinel2_uploads, sentinel_candidate_metrics):
+def render_candidate_panel(st, right, go, np, math, filtered_candidates, format_coordinates):
     candidate = None
-    sentinel_metric = None
     with right:
         st.markdown('<div class="panel"><div class="panel-title">Earth candidate map</div><div class="panel-sub">Circular candidate footprints · Copernicus GLO-30 terrain</div>', unsafe_allow_html=True)
         if st.session_state.scan_error:
@@ -71,45 +70,11 @@ def render_candidate_panel(st, right, go, np, math, filtered_candidates, candida
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar":False})
             st.caption(f"Center {format_coordinates(candidate['lat'], candidate['lon'], 5)} · circular footprint {candidate['diameter_m']} m · annular relief {candidate['annular_relief_m']:.1f} m (not crater depth)")
             st.markdown(f'<span class="tag">COPERNICUS DEM</span><span class="tag">GLiM: {len(candidate["geology"]["composition"])} mapped classes</span><span class="tag">NOT A CONFIRMED CRATER</span>', unsafe_allow_html=True)
-            with st.expander("Optional spectral check (experimental)", expanded=False):
-                st.markdown("**Sentinel-2 contact-line scan**")
-                sentinel_uploads = st.file_uploader(
-                    "Upload co-registered L2A reflectance chips named with B02, B03, B04, B11 and B12",
-                    type=["tif", "tiff"], accept_multiple_files=True, key="sentinel_bands",
-                    help="Use a small projected reflectance chip (maximum 2048 pixels/side) covering this candidate. Optional SCL band masks clouds and shadows.",
-                )
-                scale_col, threshold_col = st.columns(2)
-                with scale_col:
-                    reflectance_scale = st.number_input("Reflectance scale", min_value=0.000001, max_value=1.0,
-                                                        value=1.0, format="%.6f", key="s2_scale")
-                with threshold_col:
-                    contact_threshold = st.number_input("Contact gradient threshold / pixel", min_value=0.001,
-                                                         max_value=1.0, value=0.02, step=0.005,
-                                                         key="s2_threshold")
-                st.caption("Scale 1.0 is for reflectance already in 0–1 units. Raw L2A DN requires the product quantification and per-band offsets; this input applies a common multiplier only.")
-                if sentinel_uploads:
-                    try:
-                        sentinel_data = process_sentinel2_uploads(sentinel_uploads, reflectance_scale)
-                        sentinel_metric = sentinel_candidate_metrics(
-                            sentinel_data, candidate["lon"], candidate["lat"], candidate["diameter_m"],
-                            contact_threshold,
-                        )
-                        spectral_cols = st.columns(2)
-                        with spectral_cols[0]:
-                            st.image(sentinel_data["true_color"], caption="Sentinel-2 true color (B04/B03/B02)", use_container_width=True)
-                        with spectral_cols[1]:
-                            if sentinel_metric["contact_mask"] is not None:
-                                st.image(sentinel_metric["contact_mask"].astype("uint8") * 255,
-                                         caption="Spectral contact-gradient pixels", use_container_width=True)
-                        st.metric("Sentinel spectral heterogeneity", "Unavailable" if sentinel_metric["score"] is None else f"{sentinel_metric['score']:.1f}/100")
-                        st.caption(f"Candidate chip coverage {sentinel_metric['coverage_fraction']:.1%} · projected CRS {sentinel_data['crs']} · SCL {sentinel_data['scl']}. Iron proxy: normalized B04−B02; SWIR contrast: normalized B11−B12. These are screening indices, not mineral identifications.")
-                        st.caption("This chip updates PSI for the selected candidate only; the regional candidate list remains ordered by DEM + GLiM until spectral coverage is available for every candidate.")
-                    except Exception as exc:
-                        st.error(f"Sentinel-2 processing could not complete: {exc}")
+
         else:
             if st.session_state.get("scan_args") is None:
                 st.info("Set the reference, region, and footprint size, then run the scan to see candidates here.")
             else:
                 st.info("The last scan found no positive-relief windows that passed the available-data screen. Check the selected target or region data.")
         st.markdown('</div>', unsafe_allow_html=True)
-    return candidate, sentinel_metric
+    return candidate

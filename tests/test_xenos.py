@@ -17,9 +17,45 @@ from xenos import (
     slope_distribution,
     stratified_candidate_indices,
 )
-from sentinel import contact_gradient_score, spectral_indices
-from sentinel import process_sentinel2_uploads, sentinel_candidate_metrics
 from terramechanics import bekker_wong_scenario, particle_size_summary
+from src.xenos.validation import validate_known_sites
+
+
+class CandidateValidationTests(unittest.TestCase):
+    def test_top_k_retrieval_compares_ranked_hits_with_pool_baseline(self):
+        pool = [
+            {"lat": 0.0, "lon": 1.0, "psi": 95.0, "terrain_score": 95.0},
+            {"lat": 0.0, "lon": 0.01, "psi": 90.0, "terrain_score": 90.0},
+            {"lat": 0.0, "lon": 2.0, "psi": 80.0, "terrain_score": 80.0},
+        ]
+        data = b"site_name,latitude,longitude,tolerance_m\nheld-out,0,0,2000\n"
+        rows, summary = validate_known_sites(data, pool, top_k=(1, 2))
+        self.assertEqual(rows[0]["first_matching_rank"], 2)
+        self.assertEqual(summary["hit_at_1"], 0.0)
+        self.assertEqual(summary["hit_at_2"], 1.0)
+        self.assertAlmostEqual(summary["random_pool_hit_fraction"], 1 / 3)
+        self.assertGreater(summary["enrichment_at_2"], 1.0)
+
+    def test_withheld_score_cannot_count_as_retrieved(self):
+        pool = [{"lat": 0, "lon": 0, "psi": None}, {"lat": 1, "lon": 1, "psi": 0}]
+        rows, summary = validate_known_sites(b"site_name,latitude,longitude,tolerance_m\na,0,0,222", pool)
+        self.assertIsNone(rows[0]["first_matching_rank"])
+        self.assertEqual(summary["eligible_pool_size"], 1)
+        self.assertEqual(summary["random_baseline_at_10"], 0)
+
+    def test_sensitivity_compares_common_pool_and_flags_cutoff_tie(self):
+        from src.xenos.ranking import compare_rankings
+        pool = [{"terrain_score": t, "geology_score": 0, "psi": psi}
+                for t, psi in [(10, 6.5), (50, 32.5), (90, None)]]
+        rows, _ = compare_rankings(pool, 0.65, k=1)
+        self.assertEqual(rows[-1]["Shared with baseline"], 1)
+        self.assertEqual(rows[-1]["Samples compared"], 2)
+        self.assertTrue(rows[2]["Tie at cutoff"])
+
+    def test_validation_rejects_invalid_coordinates(self):
+        data = b"site_name,latitude,longitude\nbad,91,0\n"
+        with self.assertRaisesRegex(ValueError, "out of range"):
+            validate_known_sites(data, [{"lat": 0, "lon": 0, "psi": 1}])
 
 
 class CircularTerrainTests(unittest.TestCase):
@@ -142,19 +178,11 @@ class GeologicalScoreTests(unittest.TestCase):
         low_dem = coverage_aware_psi(80, 60, 1.0, 0.94, 10)
         too_coarse = coverage_aware_psi(80, 60, 1.0, 1.0, 5.9)
         accepted = coverage_aware_psi(80, 60, 0.95, 1.0, 10)
-        with_spectral = coverage_aware_psi(80, 60, 0.95, 1.0, 10,
-                                           sentinel_score=70, sentinel_coverage=0.95,
-                                           sentinel_available=True)
-        low_spectral = coverage_aware_psi(80, 60, 0.95, 1.0, 10,
-                                          sentinel_score=70, sentinel_coverage=0.5,
-                                          sentinel_available=True)
         self.assertIsNone(low_geo["psi"])
         self.assertIsNone(low_dem["psi"])
         self.assertIsNone(too_coarse["psi"])
         self.assertAlmostEqual(accepted["psi"], 80.0)
         self.assertTrue(accepted["reasons"])  # coarse DEM / missing GLiM scale cautions
-        self.assertAlmostEqual(with_spectral["psi"], 78.0)
-        self.assertIsNone(low_spectral["psi"])
 
     def test_psi_normalizes_geology_to_same_scale_as_terrain(self):
         result = coverage_aware_psi(100, 75, 1.0, 1.0, 12)
@@ -348,52 +376,6 @@ class PRDModuleTests(unittest.TestCase):
         self.assertEqual(result["sample_count"], 4)
         self.assertEqual(sum(result["counts"]), 4)
         self.assertEqual(result["bin_width_deg"], 5)
-
-    def test_spectral_contact_index_uses_explicit_band_inputs(self):
-        bands = {"B02": np.full((5, 5), 0.1), "B04": np.full((5, 5), 0.2),
-                 "B11": np.tile(np.linspace(0.1, 0.3, 5), (5, 1)),
-                 "B12": np.full((5, 5), 0.2)}
-        iron, swir = spectral_indices(bands)
-        self.assertTrue(np.allclose(iron, 1 / 3))
-        result = contact_gradient_score(iron, swir, np.ones((5, 5), dtype=bool), 0.01)
-        self.assertGreater(result["score"], 0)
-        self.assertEqual(result["sample_count"], 25)
-
-    def test_sentinel_geotiff_bands_align_and_measure_candidate_coverage(self):
-        import rasterio
-        from pyproj import Transformer
-        from rasterio.io import MemoryFile
-        from rasterio.transform import from_origin
-
-        class Upload:
-            def __init__(self, name, content):
-                self.name = name
-                self.content = content
-
-            def getvalue(self):
-                return self.content
-
-        crs = "EPSG:32610"
-        transform = from_origin(500000, 5100000, 10, 10)
-        uploads = []
-        for band, value in [("B02", 1000), ("B03", 1500), ("B04", 2000),
-                            ("B11", 3000), ("B12", 2500)]:
-            array = np.full((20, 20), value, dtype="uint16")
-            if band == "B11":
-                array[:, 10:] += 500
-            with MemoryFile() as mem:
-                with mem.open(driver="GTiff", height=20, width=20, count=1,
-                              dtype="uint16", crs=crs, transform=transform,
-                              nodata=0) as ds:
-                    ds.write(array, 1)
-                uploads.append(Upload(f"scene_{band}_10m.tif", mem.read()))
-        product = process_sentinel2_uploads(uploads, reflectance_scale=0.0001)
-        center_lon, center_lat = Transformer.from_crs(crs, "EPSG:4326", always_xy=True).transform(500100, 5099900)
-        result = sentinel_candidate_metrics(product, center_lon, center_lat, 100, 0.005)
-        self.assertEqual(product["shape"], (20, 20))
-        self.assertAlmostEqual(float(product["bands"]["B02"][0, 0]), 0.1, places=5)
-        self.assertGreaterEqual(result["coverage_fraction"], 0.9)
-        self.assertIsNotNone(result["score"])
 
     def test_psd_quantiles_and_bekker_curve_use_supplied_values(self):
         import pandas as pd

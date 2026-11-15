@@ -13,12 +13,11 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src.xenos import (
-    characterize_lroc_products, coverage_aware_psi, load_lunar_reference,
+    characterize_lroc_products, load_lunar_reference,
     lunar_dtm_profile, planetary_dtm_terrain_metrics, parse_crater_target_profile,
     coarsest_dem_pixel_size_m,
     scan_candidates, scan_uploaded_region, scan_region_collection,
 )
-from src.xenos.sentinel import process_sentinel2_uploads, sentinel_candidate_metrics
 from src.xenos.terramechanics import bekker_wong_scenario, particle_size_summary
 
 from src.xenos.config import ROOT, LUNAR, MGETCHIN_NAC_DTM
@@ -27,6 +26,7 @@ from src.xenos.ui.provenance import render_provenance
 from src.xenos.ui.mobility import render_mobility
 from src.xenos.ui.reference_panel import render_reference_panel
 from src.xenos.ui.candidate_panel import render_candidate_panel
+from src.xenos.ranking import compare_rankings
 from src.xenos.ui.validation import render_validation
 from src.xenos.ui.exports import render_exports
 from src.xenos.ui.briefing import render_candidate_briefing
@@ -157,9 +157,10 @@ def main():
                 st.info("Some saved entries share the same Copernicus area and are counted once: "
                         + ", ".join(duplicate_names))
             region_choice = "Installed region catalog"
-            if len(available_regions) == 1:
-                st.caption("Only Columbia River Basalts data are currently installed. Add cited region packs to data/earth/regions; see docs/region-packs/README.md.")
-            elif not available_regions:
+            if available_regions:
+                installed = ", ".join(profile["name"] for profile in available_regions)
+                st.caption(f"Installed region packs: {installed}. Scores use measured terrain and mapped geology.")
+            else:
                 st.info("No complete local region packs found. Add a region pack or upload one for this run.")
         elif region_source == "Upload one region for this run":
             custom_region_name = st.text_input("Region name", value="Uploaded Earth region")
@@ -402,22 +403,7 @@ def main():
                            cached_lroc_products, active_target, target_dtm_profile,
                            target_dtm_metrics, target_metric_name)
 
-    sentinel_metric = None
-    candidate, sentinel_metric = render_candidate_panel(st, right, go, np, math, filtered_candidates, candidates, format_coordinates, process_sentinel2_uploads, sentinel_candidate_metrics)
-
-
-    active_candidate = dict(candidate) if filtered_candidates else None
-    if filtered_candidates and sentinel_metric is not None:
-        psi_result = coverage_aware_psi(
-            candidate["terrain_score"], candidate["geology"]["score"],
-            candidate["geology"]["coverage_fraction"], candidate["dem_coverage_fraction"],
-            candidate["cells_across"], candidate["geology"]["overlap_fraction"],
-            sentinel_score=sentinel_metric["score"],
-            sentinel_coverage=sentinel_metric["coverage_fraction"], sentinel_available=True,
-        )
-        active_candidate.update({"psi": psi_result["psi"], "psi_status": psi_result["status"],
-                                "psi_reasons": psi_result["reasons"], "psi_weights": psi_result.get("weights")})
-
+    active_candidate = render_candidate_panel(st, right, go, np, math, filtered_candidates, format_coordinates)
     render_candidate_briefing(st, active_candidate)
     if active_candidate:
         st.caption("Potential use: comparative field exercises in crater-like landform mapping and mapped geological context. Xenos does not assess field access, safety, lighting, weather, communications, resources, or rover mobility.")
@@ -450,12 +436,7 @@ def main():
                 st.metric("Earth flank-band mean slope", f"{candidate['flank_mean_slope_deg']:.1f}°")
                 st.caption("Descriptive only; not scored against the target's median interior wall slope, which uses a different statistic and spatial baseline.")
             st.metric("Planetary similarity index", "Unavailable" if candidate["psi"] is None else f"{candidate['psi']:.0f}/100")
-            if candidate.get("psi_weights"):
-                weights_note = " Formula: " + " + ".join(f"{weight:.0%} {key}" for key, weight in candidate["psi_weights"].items()) + "."
-            elif sentinel_metric is not None:
-                weights_note = "."  # PSI was withheld after an incomplete Sentinel candidate overlay.
-            else:
-                weights_note = " Formula: 65% terrain similarity + 35% geology score normalized from /75 to /100." if candidate["psi"] is not None else "."
+            weights_note = " Formula: 65% terrain similarity + 35% normalized geology." if candidate["psi"] is not None else "."
             st.caption(candidate["psi_status"] + weights_note)
             if candidate["psi_reasons"]:
                 st.caption(" · ".join(candidate["psi_reasons"]))
@@ -497,7 +478,7 @@ def main():
             st.markdown(f"""**Scoring recipe**
     Terrain similarity score = max(0, 100 × (1 − |Earth annular-relief ratio − target comparison ratio| / target comparison ratio)). The target comparison ratio comes from the same circular annular-relief calculation on a local or uploaded planetary DTM when available; otherwise it uses published depth/diameter as a unlike-measure screening proxy. Annular relief is the mean elevation in the outer 0.75–1.00 radius ring minus the mean elevation in the inner 0–0.25 radius disk. It is **not** measured crater depth. The Earth flank-band slope is descriptive and excluded because it is not methodologically comparable to the target median wall slope.
     {geology_recipe}
-    PSI first normalizes the 0–75 GLiM geology score to 0–100. Without Sentinel, PSI = 0.65 × terrain proxy + 0.35 × normalized geology. With a co-registered Sentinel-2 chip covering the selected footprint, PSI = 0.55 × terrain + 0.25 × normalized geology + 0.20 × spectral heterogeneity. PSI is withheld if GLiM coverage is below 90%, valid DEM coverage below 95%, the footprint spans fewer than 6 DEM pixels, Sentinel coverage (when used) is below 90%, or overlapping GLiM polygons exceed 1%. These are screening gates, not a calibrated uncertainty model.""")
+    PSI first normalizes the 0–75 GLiM geology score to 0–100. PSI = 0.65 × terrain proxy + 0.35 × normalized geology. PSI is withheld if GLiM coverage is below 90%, valid DEM coverage below 95%, the footprint spans fewer than 6 DEM pixels, or overlapping GLiM polygons exceed 1%. These are screening gates, not a calibrated uncertainty model.""")
     else:
         st.info("Run the regional candidate scan to inspect terrain and GLiM scores.")
     st.markdown('</div>', unsafe_allow_html=True)
@@ -526,38 +507,29 @@ def main():
             terrain_weight = st.slider("Terrain weight for sensitivity check", 0.0, 1.0, 0.65, 0.05,
                                        help="Exploratory weight variation; does not overwrite the baseline PSI.")
             ranking_pool = (st.session_state.scan_summary or {}).get("ranking_pool", [])
-            diagnostic_candidates = ranking_pool
-            diagnostic_rows = []
-            for label, wt, wg, kind in [("Terrain-only ablation", 1.0, 0.0, "terrain"),
-                                        ("Geology-only ablation", 0.0, 1.0, "geology"),
-                                        (f"Sensitivity mix ({terrain_weight:.0%}/{1-terrain_weight:.0%})", terrain_weight, 1-terrain_weight, "blend"),
-                                        ("Baseline PSI (65/35)", 0.65, 0.35, "baseline")]:
-                scored = []
-                for item in diagnostic_candidates:
-                    geology_score = item["geology_score"]
-                    if kind == "terrain":
-                        score = item["terrain_score"]
-                    elif kind == "geology":
-                        score = None if geology_score is None else geology_score * (100 / 75)
-                    elif kind == "baseline":
-                        score = item["psi"]
-                    else:
-                        normalized_geology = None if geology_score is None else geology_score * (100 / 75)
-                        score = (wt * item["terrain_score"] + wg * normalized_geology
-                                 if item["psi_eligible"] and geology_score is not None else None)
-                    scored.append((item, score))
-                scored.sort(key=lambda pair: pair[1] if pair[1] is not None else -1, reverse=True)
-                for rank, (item, score) in enumerate(scored, 1):
-                    diagnostic_rows.append({"Ranking scenario": label, "Rank": rank,
-                                            "Candidate": f"{item['tile']} · {format_coordinates(item['lat'], item['lon'], 4)}",
-                                            "Score": score, "PSI eligible": item["psi_eligible"]})
-            st.dataframe(pd.DataFrame(diagnostic_rows), hide_index=True, use_container_width=True)
-            st.caption(f"Diagnostics cover {len(diagnostic_candidates)} terrain-stratified pool samples; the map shows the top spatially separated results. Terrain-only and geology-only rows are component ablations, not PSI. Sensitivity mixes and baseline PSI are withheld wherever the base evidence gates fail. These diagnostics show ranking dependence, not independent validation or calibrated accuracy.")
+            stability, rankings = compare_rankings(ranking_pool, terrain_weight)
+            if rankings:
+                st.markdown("**How many of the top ten stay on the shortlist?**")
+                st.dataframe(pd.DataFrame(stability), hide_index=True, use_container_width=True)
+                st.caption("All scenarios use the same PSI-eligible pool before map thinning. A tie at the cutoff means pool order can change shortlist membership.")
+                with st.expander("Inspect scenario ranks"):
+                    rows = [{"Scenario": label, "Rank": rank, "Region": item["region"],
+                             "Candidate": format_coordinates(item["lat"], item["lon"], 4),
+                             "Score": score} for label, rank, item, score in rankings]
+                    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            else:
+                st.info("No samples passed the PSI evidence gates for a weight comparison.")
         else:
             st.info("Ranking diagnostics become available after candidates pass the current coverage filter.")
         validation_pool = (st.session_state.scan_summary or {}).get("ranking_pool", [])
-        render_validation(st, validation_pool)
-        st.warning("No independent, preselected terrestrial analog validation set is bundled. This prototype reports ranking diagnostics and documented limitations; it does not claim measured validation accuracy.")
+        scanned = (st.session_state.scan_summary or {}).get("region_summaries", [])
+        odessa_scan = (len(scanned) == 1 and scanned[0].get("region_name") == "Odessa crater study area"
+                       and bool(scanned[0].get("region_extent_lonlat")))
+        if odessa_scan:
+            west, south, east, north = scanned[0]["region_extent_lonlat"]
+            odessa_scan = west <= -102.4791667 <= east and south <= 31.7561111 <= north
+        if not results_are_stale:
+            render_validation(st, validation_pool, odessa_scan)
 
     render_provenance(st)
 
@@ -577,7 +549,7 @@ def main():
                                 "dtm_metrics": target_dtm_metrics},
         "search": {"diameter_m": diameter, "regions": region_citations,
                    "sorted_by": "PSI when eligible; terrain score when PSI is withheld",
-                   "formula": "65% terrain similarity + 35% normalized geology; optional selected-candidate Sentinel overlay uses 55/25/20",
+                   "formula": "65% terrain similarity + 35% normalized geology",
                    "psi_gates": {"minimum_glim_coverage": 0.90, "minimum_dem_coverage": 0.95,
                                  "minimum_cells_across": 6, "maximum_polygon_overlap": 0.01}},
         "input_signatures_and_scan_parameters": requested_scan_args,
