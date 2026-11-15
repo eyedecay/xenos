@@ -96,12 +96,17 @@ def circular_window_metrics(elevation, valid, pixel_x_m: float, pixel_y_m: float
     }
 
 
-def annular_relief_proxy_score(annular_relief_ratio: float, target_depth_diameter_ratio: float):
-    """Heuristic proximity to a cited crater depth/diameter ratio; measures remain unlike."""
-    if not np.isfinite(annular_relief_ratio) or target_depth_diameter_ratio <= 0:
+def annular_relief_similarity_score(earth_annular_relief_ratio: float, target_annular_relief_ratio: float):
+    """Score proportional agreement between like-for-like annular-relief ratios."""
+    if not np.isfinite(earth_annular_relief_ratio) or not np.isfinite(target_annular_relief_ratio) or target_annular_relief_ratio <= 0:
         return None
-    return float(max(0.0, 100 * (1 - abs(annular_relief_ratio - target_depth_diameter_ratio) /
-                                      target_depth_diameter_ratio)))
+    return float(max(0.0, 100 * (1 - abs(earth_annular_relief_ratio - target_annular_relief_ratio) /
+                                      target_annular_relief_ratio)))
+
+
+def annular_relief_proxy_score(annular_relief_ratio: float, target_depth_diameter_ratio: float):
+    """Backward-compatible alias for the ratio similarity heuristic."""
+    return annular_relief_similarity_score(annular_relief_ratio, target_depth_diameter_ratio)
 
 
 def stratified_candidate_indices(scores, limit):

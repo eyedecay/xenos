@@ -62,7 +62,7 @@ def characterize_lroc_products():
 
 
 def lunar_dtm_profile(file_bytes, center_lon=67.1765, center_lat=1.3536,
-                      half_width_m=300, samples=121):
+                      half_width_m=300, samples=121, source_name="Uploaded lunar DTM"):
     """Extract a center-crossing profile from an uploaded, mapped lunar DTM GeoTIFF."""
     from pyproj import CRS, Transformer
     from rasterio.io import MemoryFile
@@ -101,7 +101,7 @@ def lunar_dtm_profile(file_bytes, center_lon=67.1765, center_lat=1.3536,
             return {"distance_m": distances.tolist(), "elevation_m": profile.tolist(),
                     "valid_fraction": float(np.isfinite(profile).mean()),
                     "pixel_size": [float(abs(ds.transform.a)), float(abs(ds.transform.e))],
-                    "crs": ds.crs.to_string(), "source": ds.tags().get("PRODUCT_ID", "Uploaded lunar DTM")}
+                    "crs": ds.crs.to_string(), "source": ds.tags().get("PRODUCT_ID", source_name)}
 
 
 def parse_crater_target_profile(data):
@@ -140,4 +140,103 @@ def parse_crater_target_profile(data):
     if any(len(code) != 2 or code not in GLIM_CLASS_LABELS for code in normalized_codes):
         raise ValueError("relevant_glim_codes must use recognized GLiM class codes")
     result["relevant_glim_codes"] = sorted(set(normalized_codes))
+    if "latitude_deg" in data or "longitude_deg" in data:
+        try:
+            latitude, longitude = float(data["latitude_deg"]), float(data["longitude_deg"])
+        except (TypeError, ValueError):
+            raise ValueError("Target latitude_deg and longitude_deg must be numeric when supplied")
+        if not (-90 <= latitude <= 90 and -360 <= longitude <= 360):
+            raise ValueError("Target coordinates are outside valid latitude/longitude ranges")
+        result["latitude_deg"] = latitude
+        result["longitude_deg"] = longitude
     return result
+
+
+def planetary_dtm_terrain_metrics(file_bytes, diameter_m, center_lon=67.1765,
+                                  center_lat=1.3536, body="Moon",
+                                  source_name="Uploaded planetary DTM"):
+    """Measure annular relief from a body-referenced DTM using the Earth footprint zones.
+
+    Requires a projected or geographic raster CRS on the same planetary body. It
+    returns None-like coverage metrics rather than inferring values from imagery.
+    """
+    from pyproj import CRS, Transformer
+    from rasterio.io import MemoryFile
+    from rasterio.windows import Window, from_bounds
+
+    radii_m = {"Moon": 1_737_400.0, "Mars": 3_389_500.0}
+    body_name = str(body).strip().title()
+    if body_name not in radii_m:
+        raise ValueError("DTM body must be Moon or Mars")
+    if diameter_m <= 0:
+        raise ValueError("Footprint diameter must be positive")
+    radius_body = radii_m[body_name]
+    geographic = CRS.from_proj4(
+        f"+proj=longlat +a={radius_body} +b={radius_body} +no_defs +type=crs"
+    )
+    local = CRS.from_proj4(
+        f"+proj=aeqd +lat_0={center_lat} +lon_0={center_lon} "
+        f"+a={radius_body} +b={radius_body} +units=m +no_defs +type=crs"
+    )
+    with MemoryFile(file_bytes) as memfile:
+        with memfile.open() as ds:
+            if ds.crs is None:
+                raise ValueError("DTM has no CRS; use a georeferenced planetary elevation raster")
+            src_crs = CRS.from_user_input(ds.crs)
+            if not math.isclose(src_crs.ellipsoid.semi_major_metre, radius_body,
+                                rel_tol=0.01):
+                raise ValueError(f"DTM CRS does not use the {body_name} reference radius")
+            source_to_local = Transformer.from_crs(src_crs, local, always_xy=True)
+            local_to_source = Transformer.from_crs(local, src_crs, always_xy=True)
+            # Transform the square containing the circular footprint to source CRS.
+            r = float(diameter_m) / 2
+            corner_x = [-r, r, r, -r]
+            corner_y = [-r, -r, r, r]
+            bx, by = local_to_source.transform(corner_x, corner_y)
+            window = from_bounds(min(bx), min(by), max(bx), max(by), ds.transform)
+            window = window.round_offsets().round_lengths()
+            window = window.intersection(Window(0, 0, ds.width, ds.height))
+            if window.width < 1 or window.height < 1:
+                raise ValueError("Planetary DTM does not cover the target footprint")
+            values = ds.read(1, window=window, masked=True).astype("float64")
+            rows, cols = np.indices(values.shape, dtype="float64")
+            transform = ds.window_transform(window)
+            xs = transform.c + (cols + 0.5) * transform.a + (rows + 0.5) * transform.b
+            ys = transform.f + (cols + 0.5) * transform.d + (rows + 0.5) * transform.e
+            local_x, local_y = source_to_local.transform(xs, ys)
+            distance = np.hypot(local_x, local_y)
+            valid = ~np.ma.getmaskarray(values) & np.isfinite(np.asarray(values))
+            footprint = distance <= r
+            center = distance <= r * 0.25
+            annulus = (distance >= r * 0.75) & footprint
+            coverage = lambda zone: float((zone & valid).sum() / zone.sum()) if zone.any() else 0.0
+            footprint_coverage = coverage(footprint)
+            center_coverage = coverage(center)
+            annulus_coverage = coverage(annulus)
+            arr = np.asarray(values.filled(np.nan), dtype="float64")
+            center_samples = arr[center & valid]
+            annulus_samples = arr[annulus & valid]
+            if not center_samples.size or not annulus_samples.size:
+                raise ValueError("DTM has no valid elevations in the center or outer annulus")
+            col_resolution = (float(np.nanmedian(np.hypot(np.diff(local_x, axis=1),
+                                                           np.diff(local_y, axis=1))))
+                              if local_x.shape[1] > 1 else float(diameter_m))
+            row_resolution = (float(np.nanmedian(np.hypot(np.diff(local_x, axis=0),
+                                                           np.diff(local_y, axis=0))))
+                              if local_y.shape[0] > 1 else float(diameter_m))
+            pixel_count_across = float(diameter_m) / max(col_resolution, row_resolution, 1e-9)
+            relief = float(annulus_samples.mean() - center_samples.mean())
+            return {
+                "body": body_name, "annular_relief_m": relief,
+                "annular_relief_ratio": relief / float(diameter_m),
+                "dem_coverage_fraction": footprint_coverage,
+                "center_coverage_fraction": center_coverage,
+                "outer_annulus_coverage_fraction": annulus_coverage,
+                "cells_across": pixel_count_across,
+                "source": ds.tags().get("PRODUCT_ID", source_name),
+                "crs": ds.crs.to_string(),
+                "eligible": (footprint_coverage >= 0.95 and center_coverage >= 0.90
+                             and annulus_coverage >= 0.90 and pixel_count_across >= 6
+                             and relief > 0),
+                "method": "same circular inner disk and outer annulus as Earth candidates",
+            }

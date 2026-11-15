@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 from ..config import DEM_DIR, GEOLOGY
 from .terrain import (circular_zone_masks, riley_terrain_ruggedness, slope_distribution,
-                     annular_relief_proxy_score, stratified_candidate_indices)
+                     annular_relief_similarity_score, stratified_candidate_indices)
 from .geology import load_geology, geology_composition
 from .scoring import (coverage_aware_psi, MIN_GEOLOGY_COVERAGE, MIN_DEM_COVERAGE,
                       MIN_CELLS_ACROSS)
@@ -14,13 +14,15 @@ from .scoring import (coverage_aware_psi, MIN_GEOLOGY_COVERAGE, MIN_DEM_COVERAGE
 def scan_candidates(diameter_m: int, target_depth_diameter_ratio: float,
                     top_per_tile: int = 72, max_candidates: int = 20,
                     dem_paths=None, geology_path=GEOLOGY,
-                    region_name="Columbia River Basalts", relevant_geology_codes=("vb",)):
+                    region_name="Columbia River Basalts", relevant_geology_codes=("vb",), target_metric_name="published depth/diameter ratio"):
     """Discover candidates from local DEM sources, stratify terrain sampling, then rank with GLiM."""
     import rasterio
     from pyproj import CRS, Transformer
     from rasterio.warp import transform_bounds
     from scipy.ndimage import convolve
 
+    if not np.isfinite(target_depth_diameter_ratio) or target_depth_diameter_ratio <= 0:
+        raise ValueError("Target comparison ratio must be finite and positive")
     tile_paths = sorted(Path(path) for path in dem_paths) if dem_paths is not None else sorted(DEM_DIR.glob("*_DEM.tif"))
     if not tile_paths:
         raise ValueError("No DEM GeoTIFFs were provided for this search region")
@@ -112,7 +114,7 @@ def scan_candidates(diameter_m: int, target_depth_diameter_ratio: float,
                 local_slope = slope[r0:r1, c0:c1]
                 slope_matrix = slope_distribution(local_slope, zones["flank"], plot_valid)
                 cells_across = diameter_m / max(dx, dy)
-                terrain_score = annular_relief_proxy_score(float(ratios[idx]), target_depth_diameter_ratio)
+                terrain_score = annular_relief_similarity_score(float(ratios[idx]), target_depth_diameter_ratio)
                 candidates.append({
                     "tile": path.stem.replace("Copernicus_DSM_COG_10_", "").replace("_DEM", ""),
                     "region": region_name,
@@ -175,6 +177,8 @@ def scan_candidates(diameter_m: int, target_depth_diameter_ratio: float,
                       "candidate_pool_size": len(candidates),
                       "ranking_pool": ranking_pool,
                       "candidate_locations": len(selected),
+                      "target_reference_ratio": float(target_depth_diameter_ratio),
+                      "target_metric_name": target_metric_name,
                       "region_extent_lonlat": region_extent,
                       "min_geology_coverage_for_psi": MIN_GEOLOGY_COVERAGE,
                       "min_dem_coverage_for_psi": MIN_DEM_COVERAGE,
@@ -184,7 +188,8 @@ def scan_candidates(diameter_m: int, target_depth_diameter_ratio: float,
 def scan_uploaded_region(diameter_m, target_depth_diameter_ratio, dem_uploads,
                         geology_name, geology_bytes, region_name="Uploaded Earth region",
                         top_per_tile=72, max_candidates=20,
-                        relevant_geology_codes=("vb",)):
+                        relevant_geology_codes=("vb",),
+                        target_metric_name="published depth/diameter ratio"):
     """Scan user-supplied GeoTIFFs and a GeoPackage without modifying source files."""
     import tempfile
 
@@ -210,4 +215,64 @@ def scan_uploaded_region(diameter_m, target_depth_diameter_ratio, dem_uploads,
             max_candidates=max_candidates, dem_paths=dem_paths,
             geology_path=geology_path, region_name=region_name,
             relevant_geology_codes=relevant_geology_codes,
+            target_metric_name=target_metric_name,
         )
+
+
+def scan_region_collection(diameter_m, target_ratio, region_profiles,
+                           relevant_geology_codes=("vb",),
+                           target_metric_name="published depth/diameter ratio",
+                           max_candidates=20):
+    """Scan each installed, independently mapped Earth region and merge results fairly."""
+    if not region_profiles:
+        raise ValueError("Select at least one installed region with complete DEM and geology data")
+    per_region = []
+    summaries = []
+    for profile in region_profiles:
+        found, summary = scan_candidates(
+            diameter_m, target_ratio, max_candidates=max_candidates,
+            dem_paths=profile["dem_paths"], geology_path=profile["geology_path"],
+            region_name=profile["name"], relevant_geology_codes=relevant_geology_codes,
+            target_metric_name=target_metric_name,
+        )
+        per_region.append(found)
+        summaries.append(summary)
+    # Round-robin by local rank so a large region cannot consume the entire map.
+    selected = []
+    max_per_region = max(1, math.ceil(max_candidates / len(per_region)))
+    for rank in range(max_candidates):
+        for found in per_region:
+            if rank < min(len(found), max_per_region) and len(selected) < max_candidates:
+                selected.append(found[rank])
+    if len(selected) < max_candidates:
+        selected_ids = {id(candidate) for candidate in selected}
+        remaining = [candidate for found in per_region for candidate in found
+                     if id(candidate) not in selected_ids]
+        remaining.sort(key=lambda item: (item["psi"] is not None,
+                                         item["psi"] if item["psi"] is not None else item["terrain_score"]),
+                       reverse=True)
+        selected.extend(remaining[:max_candidates - len(selected)])
+    extents = [summary["region_extent_lonlat"] for summary in summaries
+               if summary.get("region_extent_lonlat")]
+    merged_extent = ([min(e[0] for e in extents), min(e[1] for e in extents),
+                      max(e[2] for e in extents), max(e[3] for e in extents)]
+                     if extents else None)
+    aggregate = {
+        "region_name": ", ".join(summary["region_name"] for summary in summaries),
+        "regions_scanned": [summary["region_name"] for summary in summaries],
+        "region_sources": [{"region": profile["name"], "citation": profile.get("citation", "Not supplied")}
+                           for profile in region_profiles],
+        "tiles_read": sum(summary["tiles_read"] for summary in summaries),
+        "glim_features": sum(summary["glim_features"] for summary in summaries),
+        "candidate_windows": sum(summary["candidate_windows"] for summary in summaries),
+        "candidate_pool_size": sum(summary["candidate_pool_size"] for summary in summaries),
+        "ranking_pool": [item for summary in summaries for item in summary["ranking_pool"]],
+        "candidate_locations": len(selected), "region_extent_lonlat": merged_extent,
+        "region_summaries": summaries,
+        "target_reference_ratio": float(target_ratio),
+        "target_metric_name": target_metric_name,
+        "min_geology_coverage_for_psi": summaries[0]["min_geology_coverage_for_psi"],
+        "min_dem_coverage_for_psi": summaries[0]["min_dem_coverage_for_psi"],
+        "min_cells_across_for_psi": summaries[0]["min_cells_across_for_psi"],
+    }
+    return selected, aggregate

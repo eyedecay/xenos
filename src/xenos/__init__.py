@@ -8,8 +8,8 @@ from .analysis.geology import (
     geology_footprint_metrics, geology_composition,
 )
 from .analysis.scoring import coverage_aware_psi
-from .analysis.discovery import scan_candidates, scan_uploaded_region
+from .analysis.discovery import scan_candidates, scan_uploaded_region, scan_region_collection
 from .references import (
     load_lunar_reference, characterize_lroc_products, lunar_dtm_profile,
-    parse_crater_target_profile,
+    parse_crater_target_profile, planetary_dtm_terrain_metrics,
 )

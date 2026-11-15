@@ -23,7 +23,7 @@ div.stButton>button {background:#c5f36b;color:#101811;border:0;border-radius:7px
 div.stButton>button:hover {background:#d7ff8a;color:#101811}
 .smallnote {font-size:11px;line-height:1.55;color:#889896}
 </style>""", unsafe_allow_html=True)
-    st.markdown('<div class="hero"><div class="eyebrow">NASA Space Apps · planetary field intelligence</div><h1>Xenos <span style="color:#c5f36b">/</span></h1><p>Screen terrestrial candidates against a cited planetary crater reference.</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero"><div class="eyebrow">NASA Space Apps · planetary field intelligence</div><h1>Xenos <span style="color:#c5f36b">/</span></h1><p>Discover and compare Earth sites for planetary terrain and geology field tests.</p></div>', unsafe_allow_html=True)
 
 def metric(st, label, value, unit):
     st.markdown(f'<div class="metric"><div class="label">{label}</div><div class="value">{value} <span class="unit">{unit}</span></div></div>', unsafe_allow_html=True)
