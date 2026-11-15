@@ -1,0 +1,42 @@
+"""Coverage gates and normalized PSI combination."""
+from __future__ import annotations
+from ..config import (MIN_GEOLOGY_COVERAGE, MIN_DEM_COVERAGE, MIN_SPECTRAL_COVERAGE,
+                      MIN_CELLS_ACROSS, MAX_GEOLOGY_OVERLAP)
+
+def coverage_aware_psi(terrain_score, geology_score, geology_coverage,
+                       dem_coverage, cells_across, overlap_fraction=0.0,
+                       sentinel_score=None, sentinel_coverage=None,
+                       sentinel_available=False):
+    """Return weighted PSI only when spatial coverage and DEM support pass explicit gates."""
+    reasons = []
+    if geology_score is None:
+        reasons.append("geology score unavailable: target-relevant classes or mapped evidence missing")
+    elif geology_coverage < MIN_GEOLOGY_COVERAGE:
+        reasons.append(f"GLiM footprint coverage {geology_coverage:.0%} < {MIN_GEOLOGY_COVERAGE:.0%}")
+    if dem_coverage < MIN_DEM_COVERAGE:
+        reasons.append(f"valid DEM footprint coverage {dem_coverage:.0%} < {MIN_DEM_COVERAGE:.0%}")
+    if cells_across < MIN_CELLS_ACROSS:
+        reasons.append(f"feature spans {cells_across:.1f} pixels < {MIN_CELLS_ACROSS:.0f}-pixel minimum")
+    if overlap_fraction > MAX_GEOLOGY_OVERLAP:
+        reasons.append(f"GLiM polygons overlap by {overlap_fraction:.1%}; class areas are ambiguous")
+    if sentinel_available:
+        if sentinel_score is None:
+            reasons.append("Sentinel-2 contact score is unavailable for this candidate")
+        elif sentinel_coverage is None or sentinel_coverage < MIN_SPECTRAL_COVERAGE:
+            coverage = 0.0 if sentinel_coverage is None else sentinel_coverage
+            reasons.append(f"Sentinel-2 footprint coverage {coverage:.0%} < {MIN_SPECTRAL_COVERAGE:.0%}")
+    if reasons:
+        return {"psi": None, "status": "withheld", "reasons": reasons}
+    flags = []
+    if cells_across < 10:
+        flags.append(f"coarse DEM support ({cells_across:.1f} cells across footprint)")
+    flags.append("GLiM source-map scale is absent from this GeoPackage")
+    geology_normalized = geology_score * (100.0 / 75.0)
+    if sentinel_available:
+        psi = 0.55 * terrain_score + 0.25 * geology_normalized + 0.20 * sentinel_score
+        weights = {"terrain": 0.55, "geology": 0.25, "sentinel": 0.20}
+    else:
+        psi = 0.65 * terrain_score + 0.35 * geology_normalized
+        weights = {"terrain": 0.65, "geology": 0.35}
+    return {"psi": float(psi), "weights": weights,
+            "status": "screening score; interpret with uncertainty", "reasons": flags}
